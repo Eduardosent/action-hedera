@@ -61,6 +61,19 @@ contract ActionCore is HederaTokenService {
         address indexed admin,
         uint64 amount
     );
+    // Profits deposited by the admin
+    event ProfitsDeposited(
+        address indexed projectToken,
+        address indexed sender,
+        uint32 amount,
+        uint64 scaledAmount
+    );
+    // Profits claimed by the investor
+    event ProfitsClaimed(
+        address indexed projectToken,
+        address indexed investor,
+        uint64 amount
+    );
 
     // --- Modifiers ---
     
@@ -424,4 +437,82 @@ contract ActionCore is HederaTokenService {
         }
     }
 
+    /**
+     * @dev Authorized project admin deposits profits in the project's stablecoin.
+     * @param _projectToken Address of the RWA token.
+     * @param _amount Nominal amount (e.g., 1000 for $1000 USD).
+     */
+    function depositProfits(address _projectToken, uint64 _amount) 
+        external 
+        onlyVerified 
+    {
+        IActionData.Project storage project = projects[_projectToken];
+        
+        // Validation: Only the designated project admin or a platform operator can deposit
+        require(msg.sender == project.admin || operators[msg.sender] || msg.sender == authority, "Action: Not authorized to deposit");
+        require(_amount > 0, "Action: Amount must be greater than 0");
+        require(project.projectToken != address(0), "Action: Project not found");
+        require(project.status == IActionData.ProjectStatus.Profits, "Action: Project not in Profits phase");
+
+        // 1. Get decimals to scale the nominal amount
+        (int res, IHederaTokenService.FungibleTokenInfo memory info) = 
+            HederaTokenService.getFungibleTokenInfo(project.fundingToken);
+        require(res == 22, "Action: Failed to get token info");
+        
+        uint256 scaledAmount = uint256(_amount) * (10**uint256(uint32(info.decimals)));
+
+        // 2. Transfer: Admin -> Contract
+        int transferRes = HederaTokenService.transferToken(
+            project.fundingToken,
+            msg.sender,
+            address(this),
+            int64(uint64(scaledAmount))
+        );
+        require(transferRes == 22, "Action: Profit deposit failed");
+
+        // 3. Update nominal project accounting
+        project.totalProfitsDeposited += _amount;
+
+        // 4. Emit event (Casting _amount to uint32 to match your event definition)
+        emit ProfitsDeposited(_projectToken, msg.sender, uint32(_amount), uint64(scaledAmount));
+    }
+
+    /**
+     * @dev Allows investors to claim their share of the deposited profits.
+     * @param _projectToken Address of the RWA project token.
+     */
+    function claimProfits(address _projectToken) external onlyVerified {
+        IActionData.Project storage project = projects[_projectToken];
+        require(project.projectToken != address(0), "Action: Project not found");
+
+        IActionData.Investor storage investor = investors[_projectToken][msg.sender];
+        require(investor.balance > 0, "Action: No shares owned");
+        
+        uint256 newProfitsNominal = project.totalProfitsDeposited - investor.lastClaim;
+        require(newProfitsNominal > 0, "Action: No new profits to claim");
+
+        // 1. Calculation with high precision (Multiplication before Division)
+        (int res, IHederaTokenService.FungibleTokenInfo memory info) = 
+            HederaTokenService.getFungibleTokenInfo(project.fundingToken);
+        require(res == 22, "Action: Failed to get token info");
+
+        uint256 scaledAmount = (newProfitsNominal * uint256(investor.balance) * (10**uint256(uint32(info.decimals)))) / uint256(project.totalShares);
+
+        // 2. HTS Transfer (Interaction)
+        int64 htsAmount = int64(uint64(scaledAmount));
+        int transferRes = HederaTokenService.transferToken(
+            project.fundingToken,
+            address(this),
+            msg.sender,
+            htsAmount
+        );
+        require(transferRes == 22, "Action: Profit claim transfer failed");
+
+        // 3. State update (Effects) - Atomic and safe
+        investor.lastClaim = project.totalProfitsDeposited;
+        investor.totalClaimed += uint64(scaledAmount);
+
+        // 4. Emit event
+        emit ProfitsClaimed(_projectToken, msg.sender, uint64(scaledAmount));
+    }
 }
